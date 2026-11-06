@@ -1,0 +1,52 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+.DS_Store
+
+# Variables de entorno y secretos
+.env
+.env.*
+!.env.example
+!.env.example.*
+!.env.sample
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+ENV/
+
+# Node y React
+node_modules/
+dist/
+build/
+.vite/
+
+# Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.flutter-versions
+build/
+
+# Archivos locales
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# Copias de seguridad
+*.pre-atencion-*
+*.bak
+*.backup
+
+# Archivos temporales
+*.tmp

@@ -1,0 +1,142 @@
+import { useCallback, useEffect, useState } from 'react'
+import { LayoutDashboard, Users, Wallet, ChartNoAxesCombined, AlertTriangle, ClipboardList, BrainCircuit, Settings, Bell, LogOut, Menu, X, Search, RefreshCw } from 'lucide-react'
+import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, BarChart, Bar } from 'recharts'
+import { api, download, getSession, signIn, signOut } from './services/api'
+import './App.css'
+
+const menu = [
+  ['Dashboard', LayoutDashboard], ['Clientes', Users], ['Créditos', Wallet],
+  ['Predicción IA', BrainCircuit], ['Cobranzas', ClipboardList], ['Alertas', AlertTriangle], ['Reportes', ChartNoAxesCombined], ['Configuración', Settings],
+]
+const money = value => `S/ ${Number(value || 0).toLocaleString('es-PE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+
+function Login({ onLogin }) {
+  const [email, setEmail] = useState(''); const [password, setPassword] = useState(''); const [error, setError] = useState(''); const [busy, setBusy] = useState(false)
+  async function submit(event) { event.preventDefault(); setBusy(true); setError(''); try { await signIn(email, password); onLogin() } catch (e) { setError(e.message) } finally { setBusy(false) } }
+  return <main className="login-wrap"><form className="login-card" onSubmit={submit}><div className="brand-icon"><BrainCircuit/></div><div className="eyebrow">PRESTAIA — INTELLIGENCE FINANCE</div><h1>Inicia sesión</h1><p>Inteligencia artificial para decisiones financieras más inteligentes.</p><label>Correo electrónico<input type="email" autoComplete="username" required value={email} onChange={e=>setEmail(e.target.value)}/></label><label>Contraseña<input type="password" autoComplete="current-password" required value={password} onChange={e=>setPassword(e.target.value)}/></label>{error&&<div className="error-banner">{error}</div>}<button className="primary-button" disabled={busy}>{busy?'Validando…':'Ingresar'}</button><small>El acceso requiere una cuenta creada en Supabase Auth y un perfil PRESTAIA activo.</small></form></main>
+}
+
+function App() {
+  const [session, setSession] = useState(getSession()); const [active, setActive] = useState('Dashboard'); const [mobileMenu, setMobileMenu] = useState(false)
+  const [data, setData] = useState(null); const [rows, setRows] = useState([]); const [loading, setLoading] = useState(false); const [error, setError] = useState(''); const [query, setQuery] = useState('')
+  const [newRecord, setNewRecord] = useState(false)
+  const refresh = useCallback(async () => {
+    if (!session) return
+    queueMicrotask(() => setLoading(true))
+    try {
+      if (active === 'Dashboard') setData(await api('/api/dashboard'))
+      else if (active === 'Clientes') setRows(await api(`/api/clientes?q=${encodeURIComponent(query)}`))
+      else if (active === 'Créditos') setRows(await api(`/api/creditos?q=${encodeURIComponent(query)}`))
+      else if (active === 'Cobranzas') setRows(await api('/api/cobranzas'))
+      else if (active === 'Alertas') setRows(await api('/api/alertas'))
+      else if (active === 'Predicción IA') setRows(await api('/api/predicciones'))
+      else if (active === 'Reportes') setRows((await api('/api/reportes/cartera')).creditos)
+    } catch (e) { setError(e.message) } finally { setLoading(false) }
+  }, [active, session, query])
+  useEffect(() => { const timer = setTimeout(() => { void refresh() }, 0); return () => clearTimeout(timer) }, [refresh])
+  if (!session) return <Login onLogin={() => setSession(getSession())}/>
+  async function logout() { await signOut(); setSession(null) }
+  const stats = data ? [
+    ['Cartera total', money(data.cartera_total), Wallet], ['Créditos activos', data.creditos_activos || 0, Users],
+    ['Cuotas vencidas', data.creditos_vencidos || 0, ClipboardList], ['Saldo pendiente', money(data.saldo_pendiente), AlertTriangle],
+    ['Clientes registrados', data.clientes_registrados || 0, Users], ['Morosidad', `${data.porcentaje_morosidad || 0}%`, ChartNoAxesCombined],
+    ['Riesgo alto', data.clientes_riesgo_alto || 0, BrainCircuit], ['Alertas activas', data.alertas_activas || 0, Bell],
+  ] : []
+  return <div className="app">
+    <aside className={`sidebar ${mobileMenu?'open':''}`}><div className="brand"><div className="brand-icon"><BrainCircuit size={23}/></div><div><strong>PRESTAIA</strong><small>INTELLIGENCE FINANCE</small></div><button className="close-menu" onClick={()=>setMobileMenu(false)}><X/></button></div><div className="menu-label">MENÚ PRINCIPAL</div><nav>{menu.map(([name,Icon])=><button key={name} className={`nav-item ${active===name?'selected':''}`} onClick={()=>{setActive(name);setMobileMenu(false)}}><Icon size={18}/><span>{name}</span>{name==='Alertas'&&data?.alertas_activas>0&&<i className="notification-dot"/>}</button>)}</nav><div className="sidebar-bottom"><div className="ai-card"><BrainCircuit size={22}/><strong>PRESTAIA IA</strong><p>Inteligencia artificial para decisiones financieras más inteligentes.</p><span>● Evaluación de apoyo</span></div><button className="nav-item logout" onClick={logout}><LogOut size={18}/>Cerrar sesión</button><div className="profile"><div className="avatar">{session.user?.email?.slice(0,2).toUpperCase()||'US'}</div><div><strong>{session.user?.email||'Usuario'}</strong><small>Sesión autenticada</small></div></div></div></aside>
+    <main className="main"><header className="topbar"><button className="mobile-toggle" onClick={()=>setMobileMenu(!mobileMenu)}><Menu/></button><div className="breadcrumb">PRESTAIA <span>/</span> {active}</div><div className="top-actions"><div className="status"><i/> Sesión activa</div><button className="icon-button" title="Actualizar" onClick={refresh}><RefreshCw size={18}/></button><button className="icon-button" title="Cerrar sesión" onClick={logout}><LogOut size={18}/></button></div></header>
+      <div className="content"><div className="welcome"><div><div className="eyebrow">PANEL DE INTELIGENCIA FINANCIERA</div><h1>{active==='Dashboard'?'Resumen general':active}</h1><p>Monitorea la cartera registrada y anticipa riesgos financieros.</p></div><button className="refresh-button" onClick={refresh}>Actualizar</button></div>
+      {error&&<div className="error-banner">{error} <button onClick={refresh}>Reintentar</button></div>}{loading&&<p className="empty-state">Consultando información…</p>}
+      {active==='Dashboard'&&<>
+        <div className="stats-grid">{stats.map(([title,value,Icon],i)=><div className="stat-card" key={title}><div className="stat-top"><span>{title}</span><div className={`stat-icon icon-${i%4}`}><Icon size={19}/></div></div><h2>{value}</h2><div className="stat-foot"><span className="muted">Datos de PostgreSQL</span></div></div>)}</div>
+        <div className="charts-grid"><section className="panel trend-panel"><div className="panel-heading"><div><h3>Evolución de cartera</h3><p>Se habilitará con historial mensual registrado</p></div></div>{data?.evolucion?.length?<div className="chart"><ResponsiveContainer><AreaChart data={data.evolucion}><CartesianGrid strokeDasharray="3 3"/><XAxis dataKey="mes"/><YAxis/><Tooltip/><Area dataKey="cartera" stroke="#3578dc" fill="#dce9ff"/></AreaChart></ResponsiveContainer></div>:<div className="empty-state">Aún no hay historial mensual suficiente.</div>}</section><section className="panel"><div className="panel-heading"><div><h3>Distribución de riesgo</h3><p>Evaluaciones guardadas</p></div><BrainCircuit/></div>{(data?.distribucion_riesgo||[]).some(x=>x.cantidad>0)?<div className="risk-chart"><ResponsiveContainer><BarChart data={data.distribucion_riesgo} layout="vertical"><CartesianGrid strokeDasharray="3 3"/><XAxis type="number"/><YAxis type="category" dataKey="nivel" width={55}/><Tooltip/><Bar dataKey="cantidad" fill="#3578dc"/></BarChart></ResponsiveContainer></div>:<div className="empty-state">Sin evaluaciones registradas.</div>}</section></div>
+        <section className="panel clients-panel"><div className="panel-heading"><div><h3>Créditos que requieren seguimiento</h3><p>Próximos vencimientos registrados</p></div><button className="view-button" onClick={()=>setActive('Cobranzas')}>Ver cobranzas</button></div><DataTable rows={data?.seguimiento||[]} columns={['codigo','cliente','monto','saldo','vencimiento','estado']} empty="No hay créditos que mostrar."/></section>
+        <div className="bottom-grid"><section className="panel alert-panel"><div className="panel-heading"><div><h3>Alertas activas</h3><p>Vencimientos cercanos y cuotas vencidas</p></div><Bell size={18}/></div>{data?.alertas?.length?data.alertas.map(a=><div className="alert-item" key={a.id}><span className="alert-symbol red"><AlertTriangle size={17}/></span><div><strong>{a.tipo.replaceAll('_',' ')}</strong><p>{a.mensaje}</p></div></div>):<div className="empty-state">No hay alertas activas.</div>}</section><section className="panel ai-panel"><div className="ai-heading"><BrainCircuit size={21}/><div><h3>Asistente PRESTAIA</h3><p>Respuestas con datos registrados</p></div></div><Assistant/><button className="ai-button" onClick={()=>setActive('Predicción IA')}>Ir a evaluación de riesgo</button></section></div>
+      </>}
+      {['Clientes','Créditos'].includes(active)&&<section className="panel"><div className="panel-heading"><div><h3>{active} registrados</h3><p>Consulta los registros persistidos</p></div><div className="table-actions"><label className="search-box"><Search size={16}/><input placeholder="Buscar por nombre o código" value={query} onChange={e=>setQuery(e.target.value)}/></label><button className="view-button" onClick={()=>setNewRecord(!newRecord)}>{newRecord?'Cerrar':'Nuevo registro'}</button></div></div>{newRecord&&(active==='Clientes'?<ClientForm onDone={()=>{setError("");setNewRecord(false);refresh()}} onError={setError}/>:<CreditForm onDone={()=>{setError("");setNewRecord(false);refresh()}} onError={setError}/>)}<DataTable rows={rows} columns={active==='Clientes'?['codigo','nombres','apellidos','tipo_documento','numero_documento','telefono','correo','activo']:['codigo','cliente','monto','saldo_pendiente','fecha_vencimiento','estado']} empty={`No hay ${active.toLowerCase()} registrados.`}/></section>}
+      {active==='Cobranzas'&&<section className="panel"><div className="panel-heading"><div><h3>Cuotas pendientes</h3><p>Saldo y atraso calculados al día de hoy</p></div></div><DataTable rows={rows} columns={['credito','cliente','vence','dias_atraso','saldo','estado']} empty="No hay cuotas pendientes."/></section>}
+      {active==='Alertas'&&<section className="panel"><DataTable rows={rows} columns={['tipo','mensaje','prioridad','creado_en']} empty="No hay alertas activas."/></section>}
+      {active==='Predicción IA'&&<><div className="section-notice"><BrainCircuit size={22}/><div><strong>Evaluación preliminar basada en reglas explícitas</strong><p>No es machine learning entrenado ni aprueba o rechaza créditos. Selecciona un crédito para guardar una evaluación.</p></div></div><section className="panel"><EvaluationForm onDone={refresh} onError={setError}/><DataTable rows={rows} columns={['credito_id','probabilidad_morosidad','nivel_riesgo','metodo','recomendacion','creado_en']} empty="Aún no hay predicciones registradas."/></section></>}
+      {active==='Reportes'&&<section className="panel"><div className="panel-heading"><div><h3>Reporte de cartera</h3><p>Créditos persistidos en PostgreSQL</p></div><button className="view-button" onClick={()=>download('/api/reportes/cartera?formato=csv','prestaia-cartera.csv').catch(err=>setError(err.message))}>Exportar CSV</button></div><DataTable rows={rows} columns={['codigo','cliente','monto','saldo_pendiente','estado','fecha_desembolso','fecha_vencimiento']} empty="Sin registros para el reporte."/></section>}
+      {active==='Configuración'&&<section className="panel"><h3>Configuración</h3><p>PRESTAIA — INTELLIGENCE FINANCE</p><p>Entorno API: {import.meta.env.VITE_API_URL||'http://localhost:8000'}</p><p>Sesión de Supabase Auth activa. Los roles se resuelven en el backend desde perfiles.</p><p>Proveedor IA: evaluación local explicable; no hay API externa configurada.</p></section>}
+      <footer>PRESTAIA © 2026 · Sistema de apoyo a decisiones financieras <span>Versión 1.0.0</span></footer></div></main></div>
+}
+
+function DataTable({rows,columns,empty}) { return <div className="table-scroll">{rows?.length?<table><thead><tr>{columns.map(c=><th key={c}>{c.replaceAll('_',' ').toUpperCase()}</th>)}</tr></thead><tbody>{rows.map((row,i)=><tr key={row.id||row.codigo||i}>{columns.map(c=><td key={c}>{typeof row[c]==='object'&&row[c]!==null?JSON.stringify(row[c]):String(row[c]??'—')}</td>)}</tr>)}</tbody></table>:<div className="empty-state">{empty}</div>}</div> }
+
+function ClientForm({ onDone, onError }) {
+  const [busy, setBusy] = useState(false)
+
+  async function submit(e) {
+    e.preventDefault()
+    if (busy) return
+
+    setBusy(true)
+    onError("")
+
+    const form = new FormData(e.currentTarget)
+    const body = Object.fromEntries(form.entries())
+
+    for (const key of ["codigo", "tipo_documento", "numero_documento", "nombres", "apellidos"]) {
+      body[key] = String(body[key] || "").trim()
+    }
+
+    for (const key of ["telefono", "correo"]) {
+      body[key] = String(body[key] || "").trim() || null
+    }
+
+    body.ingresos_mensuales = body.ingresos_mensuales
+      ? Number(body.ingresos_mensuales)
+      : null
+
+    try {
+      await api("/api/clientes", {
+        method: "POST",
+        body: JSON.stringify(body),
+      })
+      onDone()
+    } catch (err) {
+      onError(err.message || "No se pudo guardar el cliente.")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <form className="record-form" onSubmit={submit}>
+      <label>Código<input name="codigo" placeholder="CLI-001" required maxLength="30" /></label>
+      <label>Tipo de documento
+        <select name="tipo_documento" required defaultValue="">
+          <option value="" disabled>Selecciona documento</option>
+          <option value="DNI">DNI</option>
+          <option value="CE">Carné de extranjería</option>
+          <option value="RUC">RUC</option>
+          <option value="PASAPORTE">Pasaporte</option>
+        </select>
+      </label>
+      <label>Número de documento<input name="numero_documento" required maxLength="40" /></label>
+      <label>Nombres<input name="nombres" required maxLength="100" /></label>
+      <label>Apellidos<input name="apellidos" required maxLength="100" /></label>
+      <label>Teléfono<input name="telefono" type="tel" placeholder="Opcional" /></label>
+      <label>Correo<input name="correo" type="email" placeholder="Opcional" /></label>
+      <label>Ingresos mensuales (S/)
+        <input name="ingresos_mensuales" type="number" min="0" step="0.01" placeholder="Opcional" />
+      </label>
+      <button className="primary-button" type="submit" disabled={busy}>
+        {busy ? "Guardando cliente..." : "Guardar cliente"}
+      </button>
+    </form>
+  )
+}
+
+function CreditForm({onDone,onError}) {
+  const [clients,setClients]=useState([])
+  useEffect(()=>{api('/api/clientes?limit=100').then(setClients).catch(e=>onError(e.message))},[onError])
+  async function submit(e){e.preventDefault();const f=new FormData(e.currentTarget);const body=Object.fromEntries(f);body.monto=Number(body.monto);body.tasa_interes=Number(body.tasa_interes);body.plazo_meses=Number(body.plazo_meses);try{await api('/api/creditos',{method:'POST',body:JSON.stringify(body)});onDone()}catch(err){onError(err.message)}}
+  return <form className="record-form" onSubmit={submit}><label>Código<input name="codigo" required/></label><label>Cliente<select name="cliente_id" required defaultValue=""><option value="" disabled>Selecciona cliente</option>{clients.map(c=><option key={c.id} value={c.id}>{c.codigo} · {c.nombres} {c.apellidos}</option>)}</select></label><label>Monto<input name="monto" type="number" min="0.01" step="0.01" required/></label><label>Tasa anual (%)<input name="tasa_interes" type="number" min="0" max="100" step="0.01" required/></label><label>Plazo (meses)<input name="plazo_meses" type="number" min="1" max="600" required/></label><label>Frecuencia<select name="frecuencia_pago"><option value="mensual">Mensual</option><option value="quincenal">Quincenal</option><option value="semanal">Semanal</option></select></label><label>Desembolso<input name="fecha_desembolso" type="date" required/></label><label>Vencimiento<input name="fecha_vencimiento" type="date" required/></label><button className="primary-button">Registrar crédito</button></form>
+}
+
+function EvaluationForm({onDone,onError}) { const [credits,setCredits]=useState([]); const [id,setId]=useState(''); useEffect(()=>{api('/api/creditos?limit=100').then(setCredits).catch(e=>onError(e.message))},[onError]); async function submit(e){e.preventDefault();try{await api(`/api/predicciones/evaluar?credito_id=${id}`,{method:'POST'});onDone()}catch(err){onError(err.message)}} return <form className="inline-form" onSubmit={submit}><select required value={id} onChange={e=>setId(e.target.value)}><option value="">Selecciona crédito para evaluar</option>{credits.map(c=><option value={c.id} key={c.id}>{c.codigo} · {c.cliente}</option>)}</select><button className="primary-button">Evaluar riesgo</button></form> }
+
+function Assistant() { const [question,setQuestion]=useState(''); const [answer,setAnswer]=useState(''); const [error,setError]=useState(''); async function ask(e){e.preventDefault();setError('');try{const result=await api(`/api/asistente?q=${encodeURIComponent(question)}`);setAnswer(result.respuesta)}catch(err){setError(err.message)}} return <><p className="ai-description">Pregunta por cartera, saldos, clientes, cuotas vencidas o alertas.</p><form className="assistant-form" onSubmit={ask}><input placeholder="¿Cuántas cuotas están vencidas?" value={question} onChange={e=>setQuestion(e.target.value)} required/><button>Consultar</button></form>{answer&&<p className="assistant-answer">{answer}</p>}{error&&<p className="assistant-answer">{error}</p>}</> }
+export default App

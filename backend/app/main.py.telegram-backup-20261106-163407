@@ -1,0 +1,637 @@
+"""PRESTAIA API. Database access is server-side; Supabase bearer tokens are verified with Auth."""
+from __future__ import annotations
+
+import csv
+import io
+import os
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from decimal import Decimal
+from enum import Enum
+from typing import Optional
+from uuid import UUID, uuid4
+
+import httpx
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import (Boolean, Date, DateTime, Enum as SAEnum, ForeignKey, Numeric,
+                        String, Text, UniqueConstraint, create_engine, func, select)
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=Path(__file__).resolve().parents[1] / ".env", extra="ignore")
+    app_env: str = "development"
+    database_url: str = ""
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
+    cors_origins: str = "http://localhost:5173"
+    ai_api_key: str = ""
+
+
+settings = Settings()
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Rol(str, Enum):
+    administrador = "administrador"
+    analista = "analista"
+    cobranzas = "cobranzas"
+
+
+class EstadoCredito(str, Enum):
+    activo = "activo"
+    pagado = "pagado"
+    vencido = "vencido"
+    cancelado = "cancelado"
+
+
+class Perfil(Base):
+    __tablename__ = "perfiles"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    rol: Mapped[str] = mapped_column(String(30), default="analista")
+    nombre: Mapped[Optional[str]] = mapped_column(String(120))
+    activo: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class Cliente(Base):
+    __tablename__ = "clientes"
+    __table_args__ = (UniqueConstraint("tipo_documento", "numero_documento", name="uq_cliente_documento"),)
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    codigo: Mapped[str] = mapped_column(String(30), unique=True, index=True)
+    tipo_documento: Mapped[str] = mapped_column(String(30))
+    numero_documento: Mapped[str] = mapped_column(String(40), index=True)
+    nombres: Mapped[str] = mapped_column(String(100))
+    apellidos: Mapped[str] = mapped_column(String(100))
+    telefono: Mapped[Optional[str]] = mapped_column(String(30))
+    correo: Mapped[Optional[str]] = mapped_column(String(254))
+    direccion: Mapped[Optional[str]] = mapped_column(Text)
+    ingresos_mensuales: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
+    activo: Mapped[bool] = mapped_column(Boolean, default=True)
+    creado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    actualizado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class Credito(Base):
+    __tablename__ = "creditos"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    codigo: Mapped[str] = mapped_column(String(30), unique=True, index=True)
+    cliente_id: Mapped[UUID] = mapped_column(ForeignKey("clientes.id", ondelete="RESTRICT"), index=True)
+    monto: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    tasa_interes: Mapped[Decimal] = mapped_column(Numeric(7, 4))
+    plazo_meses: Mapped[int] = mapped_column()
+    frecuencia_pago: Mapped[str] = mapped_column(String(20), default="mensual")
+    fecha_desembolso: Mapped[date] = mapped_column(Date)
+    fecha_vencimiento: Mapped[date] = mapped_column(Date)
+    saldo_pendiente: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    estado: Mapped[str] = mapped_column(String(20), default="activo", index=True)
+    creado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    cliente: Mapped[Cliente] = relationship()
+    cuotas: Mapped[list["Cuota"]] = relationship(back_populates="credito", cascade="all, delete-orphan")
+
+
+class Cuota(Base):
+    __tablename__ = "cuotas"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    credito_id: Mapped[UUID] = mapped_column(ForeignKey("creditos.id", ondelete="CASCADE"), index=True)
+    numero: Mapped[int] = mapped_column()
+    fecha_vencimiento: Mapped[date] = mapped_column(Date, index=True)
+    monto: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    saldo_pendiente: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    estado: Mapped[str] = mapped_column(String(20), default="pendiente", index=True)
+    credito: Mapped[Credito] = relationship(back_populates="cuotas")
+
+
+class Pago(Base):
+    __tablename__ = "pagos"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    cuota_id: Mapped[UUID] = mapped_column(ForeignKey("cuotas.id", ondelete="RESTRICT"), index=True)
+    monto: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    pagado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    referencia: Mapped[Optional[str]] = mapped_column(String(100))
+
+
+class Prediccion(Base):
+    __tablename__ = "predicciones"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    credito_id: Mapped[UUID] = mapped_column(ForeignKey("creditos.id", ondelete="CASCADE"), index=True)
+    probabilidad_morosidad: Mapped[Decimal] = mapped_column(Numeric(5, 4))
+    nivel_riesgo: Mapped[str] = mapped_column(String(10), index=True)
+    metodo: Mapped[str] = mapped_column(String(40), default="reglas_preliminares_v1")
+    factores: Mapped[str] = mapped_column(Text, default="[]")
+    recomendacion: Mapped[str] = mapped_column(Text)
+    creado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Alerta(Base):
+    __tablename__ = "alertas"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    credito_id: Mapped[Optional[UUID]] = mapped_column(ForeignKey("creditos.id", ondelete="CASCADE"), index=True)
+    cuota_id: Mapped[Optional[UUID]] = mapped_column(ForeignKey("cuotas.id", ondelete="CASCADE"), index=True)
+    tipo: Mapped[str] = mapped_column(String(40))
+    mensaje: Mapped[str] = mapped_column(Text)
+    prioridad: Mapped[str] = mapped_column(String(15), default="media")
+    clave_dedupe: Mapped[str] = mapped_column(String(180), unique=True)
+    resuelta: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    creado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GestionCobranza(Base):
+    __tablename__ = "gestiones_cobranza"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    credito_id: Mapped[UUID] = mapped_column(ForeignKey("creditos.id", ondelete="CASCADE"), index=True)
+    cuota_id: Mapped[Optional[UUID]] = mapped_column(ForeignKey("cuotas.id", ondelete="SET NULL"), index=True)
+    usuario_id: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), ForeignKey("perfiles.id", ondelete="SET NULL"))
+    canal: Mapped[str] = mapped_column(String(30))
+    resultado: Mapped[str] = mapped_column(String(50))
+    notas: Mapped[Optional[str]] = mapped_column(Text)
+    compromiso_monto: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
+    compromiso_fecha: Mapped[Optional[date]] = mapped_column(Date)
+    seguimiento_fecha: Mapped[Optional[date]] = mapped_column(Date, index=True)
+    creado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+database_url = settings.database_url
+if database_url.startswith("postgresql://"):
+    database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+engine = create_engine(database_url, pool_pre_ping=True) if database_url else None
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False) if engine else None
+
+
+def db_session():
+    if SessionLocal is None:
+        raise HTTPException(503, "Base de datos no configurada. Configure DATABASE_URL.")
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+async def current_user(authorization: Optional[str] = Header(default=None), db: Session = Depends(db_session)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Autenticación requerida")
+    if not settings.supabase_url or not settings.supabase_anon_key:
+        raise HTTPException(503, "Autenticación Supabase no configurada")
+    token = authorization.split(" ", 1)[1]
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            response = await client.get(f"{settings.supabase_url.rstrip('/')}/auth/v1/user", headers={"Authorization": f"Bearer {token}", "apikey": settings.supabase_anon_key})
+        if response.status_code != 200:
+            raise HTTPException(401, "Sesión inválida o expirada")
+        user_id = UUID(response.json()["id"])
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(503, "Supabase Auth no respondió a tiempo")
+    except httpx.RequestError:
+        raise HTTPException(503, "No fue posible conectar con Supabase Auth")
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(401, "Supabase devolvió una sesión inválida")
+    profile = db.get(Perfil, user_id)
+    if not profile or not profile.activo:
+        raise HTTPException(403, "Perfil sin acceso activo")
+    return {"id": user_id, "rol": profile.rol}
+
+
+def require_roles(*roles):
+    async def checker(user=Depends(current_user)):
+        if user["rol"] not in roles:
+            raise HTTPException(403, "Permisos insuficientes")
+        return user
+    return checker
+
+
+class ClienteIn(BaseModel):
+    codigo: str = Field(min_length=2, max_length=30)
+    tipo_documento: str = Field(min_length=2, max_length=30)
+    numero_documento: str = Field(min_length=3, max_length=40)
+    nombres: str = Field(min_length=1, max_length=100)
+    apellidos: str = Field(min_length=1, max_length=100)
+    telefono: Optional[str] = Field(default=None, max_length=30)
+    correo: Optional[str] = Field(default=None, max_length=254)
+    direccion: Optional[str] = None
+    ingresos_mensuales: Optional[Decimal] = Field(default=None, ge=0)
+    activo: bool = True
+
+    @field_validator("telefono", "correo", "direccion", "ingresos_mensuales", mode="before")
+    @classmethod
+    def normalizar_campos_opcionales(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return None
+        return value
+
+    @field_validator("correo")
+    @classmethod
+    def correo_valido(cls, value):
+        if value is not None and ("@" not in value or "." not in value.rsplit("@", 1)[-1]):
+            raise ValueError("Correo electrónico no válido")
+        return value
+
+    @field_validator("telefono")
+    @classmethod
+    def telefono_valido(cls, value):
+        if value is not None:
+            digits = sum(ch.isdigit() for ch in value)
+            if digits < 6 or digits > 15 or any(not (ch.isdigit() or ch in "+-() ") for ch in value):
+                raise ValueError("Teléfono no válido")
+        return value
+
+
+class CreditoIn(BaseModel):
+    codigo: str = Field(min_length=2, max_length=30)
+    cliente_id: UUID
+    monto: Decimal = Field(gt=0, le=Decimal("100000000"))
+    tasa_interes: Decimal = Field(ge=0, le=100)
+    plazo_meses: int = Field(ge=1, le=600)
+    frecuencia_pago: str = Field(default="mensual", pattern="^(semanal|quincenal|mensual)$")
+    fecha_desembolso: date
+    fecha_vencimiento: date
+    saldo_pendiente: Optional[Decimal] = Field(default=None, ge=0)
+    estado: EstadoCredito = EstadoCredito.activo
+
+    @field_validator("codigo", mode="before")
+    @classmethod
+    def normalizar_codigo(cls, value):
+        if isinstance(value, str):
+            value = value.strip().upper()
+        return value
+
+    @field_validator("fecha_vencimiento")
+    @classmethod
+    def fechas_validas(cls, value, info):
+        desembolso = info.data.get("fecha_desembolso")
+        if desembolso and value <= desembolso:
+            raise ValueError("El vencimiento debe ser posterior al desembolso")
+        return value
+
+
+class GestionIn(BaseModel):
+    credito_id: UUID
+    cuota_id: Optional[UUID] = None
+    canal: str = Field(min_length=2, max_length=30)
+    resultado: str = Field(min_length=2, max_length=50)
+    notas: Optional[str] = None
+    compromiso_monto: Optional[Decimal] = Field(default=None, gt=0)
+    compromiso_fecha: Optional[date] = None
+    seguimiento_fecha: Optional[date] = None
+
+
+class PagoIn(BaseModel):
+    cuota_id: UUID
+    monto: Decimal = Field(gt=0)
+    referencia: Optional[str] = Field(default=None, max_length=100)
+
+
+app = FastAPI(title="PRESTAIA — INTELLIGENCE FINANCE", description="API de gestión financiera y apoyo a decisiones de riesgo crediticio.", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=[x.strip() for x in settings.cors_origins.split(",") if x.strip()], allow_credentials=True, allow_methods=["GET", "POST", "PUT", "PATCH"], allow_headers=["Authorization", "Content-Type"])
+
+
+@app.get("/")
+def root():
+    return {"proyecto": "PRESTAIA", "mensaje": "Inteligencia artificial para decisiones financieras más inteligentes.", "estado": "activo"}
+
+
+@app.get("/api/health")
+def health(db: Session = Depends(db_session)):
+    try:
+        db.execute(select(1))
+        return {"status": "ok", "database": "conectada"}
+    except Exception:
+        db.rollback()
+        raise HTTPException(503, "Base de datos no disponible")
+
+
+def dashboard_data(db: Session):
+    today = date.today()
+    credits = list(db.scalars(select(Credito).where(Credito.estado.in_(["activo", "vencido"]))))
+    clientes_count = db.scalar(select(func.count()).select_from(Cliente)) or 0
+    overdue = db.scalar(select(func.count()).select_from(Cuota).where(Cuota.saldo_pendiente > 0, Cuota.fecha_vencimiento < today)) or 0
+    installments = db.scalar(select(func.count()).select_from(Cuota)) or 0
+    total = sum((c.monto for c in credits), Decimal(0))
+    balance = sum((c.saldo_pendiente for c in credits), Decimal(0))
+    alerts_count = db.scalar(select(func.count()).select_from(Alerta).where(Alerta.resuelta.is_(False))) or 0
+    high = db.scalar(select(func.count(func.distinct(Prediccion.credito_id))).where(Prediccion.nivel_riesgo == "alto")) or 0
+    payments = db.scalar(select(func.coalesce(func.sum(Pago.monto), 0))) or Decimal(0)
+    return {"cartera_total": total, "creditos_activos": sum(c.estado == "activo" for c in credits), "creditos_vencidos": overdue, "saldo_pendiente": balance, "pagos_recibidos": payments, "clientes_registrados": clientes_count, "porcentaje_morosidad": round(overdue / max(installments, 1) * 100, 2), "clientes_riesgo_alto": high, "alertas_activas": alerts_count}
+
+
+@app.get("/api/dashboard")
+def dashboard(db: Session = Depends(db_session), user=Depends(current_user)):
+    data = dashboard_data(db)
+    followups = db.execute(select(Credito, Cliente).join(Cliente).where(Credito.estado.in_(["activo", "vencido"])).order_by(Credito.fecha_vencimiento).limit(8)).all()
+    data["seguimiento"] = [{"credito_id": str(c.id), "codigo": c.codigo, "cliente": f"{cl.nombres} {cl.apellidos}", "monto": c.monto, "saldo": c.saldo_pendiente, "vencimiento": c.fecha_vencimiento.isoformat(), "estado": c.estado} for c, cl in followups]
+    monthly = db.execute(select(func.to_char(Credito.fecha_desembolso, "YYYY-MM").label("mes"), func.sum(Credito.monto).label("cartera")).group_by("mes").order_by("mes").limit(12)).all()
+    data["evolucion"] = [{"mes": month, "cartera": float(amount or 0)} for month, amount in monthly]
+    data["distribucion_riesgo"] = [{"nivel": n, "cantidad": db.scalar(select(func.count()).select_from(Prediccion).where(Prediccion.nivel_riesgo == n)) or 0} for n in ("bajo", "medio", "alto")]
+    data["alertas"] = [{"id": str(a.id), "tipo": a.tipo, "mensaje": a.mensaje, "prioridad": a.prioridad} for a in db.scalars(select(Alerta).where(Alerta.resuelta.is_(False)).order_by(Alerta.creado_en.desc()).limit(5))]
+    return data
+
+
+@app.get("/api/clientes")
+def list_clients(q: str = "", offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100), db: Session = Depends(db_session), user=Depends(current_user)):
+    stmt = select(Cliente).order_by(Cliente.creado_en.desc())
+    if q:
+        like = f"%{q.strip()}%"
+        stmt = stmt.where((Cliente.nombres.ilike(like)) | (Cliente.apellidos.ilike(like)) | (Cliente.codigo.ilike(like)) | (Cliente.numero_documento.ilike(like)))
+    rows = db.scalars(stmt.offset(offset).limit(limit)).all()
+    return [{"id": str(x.id), "codigo": x.codigo, "tipo_documento": x.tipo_documento, "numero_documento": x.numero_documento, "nombres": x.nombres, "apellidos": x.apellidos, "telefono": x.telefono, "correo": x.correo, "direccion": x.direccion, "ingresos_mensuales": x.ingresos_mensuales, "activo": x.activo} for x in rows]
+
+
+@app.post("/api/clientes", status_code=201)
+def create_client(payload: ClienteIn, db: Session = Depends(db_session), user=Depends(require_roles("administrador", "analista"))):
+    from sqlalchemy.exc import IntegrityError
+
+    data = payload.model_dump()
+    data["codigo"] = data["codigo"].strip()
+    data["tipo_documento"] = data["tipo_documento"].strip().upper()
+    data["numero_documento"] = data["numero_documento"].strip().upper()
+    data["nombres"] = data["nombres"].strip()
+    data["apellidos"] = data["apellidos"].strip()
+
+    if not data["codigo"] or not data["numero_documento"] or not data["nombres"] or not data["apellidos"]:
+        raise HTTPException(422, "Complete los campos obligatorios del cliente")
+
+    existing_code = db.scalar(
+        select(Cliente.id).where(Cliente.codigo == data["codigo"]).limit(1)
+    )
+    if existing_code:
+        raise HTTPException(409, f"El código {data['codigo']} ya está registrado")
+
+    existing_document = db.scalar(
+        select(Cliente.id).where(
+            Cliente.tipo_documento == data["tipo_documento"],
+            Cliente.numero_documento == data["numero_documento"]
+        ).limit(1)
+    )
+    if existing_document:
+        raise HTTPException(
+            409,
+            f"El documento {data['numero_documento']} ya está registrado para ese tipo de documento"
+        )
+
+    obj = Cliente(**data)
+    db.add(obj)
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        constraint = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+
+        if constraint == "uq_cliente_documento":
+            raise HTTPException(409, "Este documento ya está registrado") from exc
+
+        if constraint in ("clientes_codigo_key", "uq_clientes_codigo"):
+            raise HTTPException(409, "Este código de cliente ya está registrado") from exc
+
+        raise HTTPException(409, "No se pudo guardar el cliente por una restricción de la base de datos") from exc
+
+    db.refresh(obj)
+    return {"id": str(obj.id), "codigo": obj.codigo}
+
+
+@app.get("/api/clientes/{client_id}")
+def get_client(client_id: UUID, db: Session = Depends(db_session), user=Depends(current_user)):
+    obj = db.get(Cliente, client_id)
+    if not obj:
+        raise HTTPException(404, "Cliente no encontrado")
+    return {"id": str(obj.id), "codigo": obj.codigo, "tipo_documento": obj.tipo_documento, "numero_documento": obj.numero_documento, "nombres": obj.nombres, "apellidos": obj.apellidos, "telefono": obj.telefono, "correo": obj.correo, "direccion": obj.direccion, "ingresos_mensuales": obj.ingresos_mensuales, "activo": obj.activo}
+
+
+@app.put("/api/clientes/{client_id}")
+def update_client(client_id: UUID, payload: ClienteIn, db: Session = Depends(db_session), user=Depends(require_roles("administrador", "analista"))):
+    obj = db.get(Cliente, client_id)
+    if not obj:
+        raise HTTPException(404, "Cliente no encontrado")
+    for key, value in payload.model_dump().items(): setattr(obj, key, value)
+    try: db.commit()
+    except Exception:
+        db.rollback(); raise HTTPException(409, "Documento o código ya registrado")
+    return {"id": str(obj.id), "actualizado": True}
+
+
+@app.get("/api/creditos")
+def list_credits(q: str = "", offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100), db: Session = Depends(db_session), user=Depends(current_user)):
+    stmt = select(Credito, Cliente).join(Cliente).order_by(Credito.creado_en.desc())
+    if q:
+        like = f"%{q}%"; stmt = stmt.where((Credito.codigo.ilike(like)) | (Cliente.nombres.ilike(like)) | (Cliente.apellidos.ilike(like)))
+    return [{"id": str(c.id), "codigo": c.codigo, "cliente_id": str(cl.id), "cliente": f"{cl.nombres} {cl.apellidos}", "monto": c.monto, "tasa_interes": c.tasa_interes, "plazo_meses": c.plazo_meses, "frecuencia_pago": c.frecuencia_pago, "fecha_desembolso": c.fecha_desembolso, "fecha_vencimiento": c.fecha_vencimiento, "saldo_pendiente": c.saldo_pendiente, "estado": c.estado} for c, cl in db.execute(stmt.offset(offset).limit(limit)).all()]
+
+
+@app.post("/api/creditos", status_code=201)
+def create_credit(payload: CreditoIn, db: Session = Depends(db_session), user=Depends(require_roles("administrador", "analista"))):
+    if not db.get(Cliente, payload.cliente_id): raise HTTPException(404, "Cliente no encontrado")
+    data = payload.model_dump(); data["saldo_pendiente"] = data["monto"] if data["saldo_pendiente"] is None else data["saldo_pendiente"]
+    if data["saldo_pendiente"] > data["monto"]: raise HTTPException(422, "El saldo no puede superar el monto del crédito")
+    obj = Credito(**data); db.add(obj)
+    try: db.flush()
+    except Exception: db.rollback(); raise HTTPException(409, "Código de crédito duplicado")
+    # plazo_meses determina el plazo contractual; la frecuencia define cuántas cuotas caben.
+    period_days = {"semanal": 7, "quincenal": 15, "mensual": 30}[obj.frecuencia_pago]
+    duration_days = max((obj.fecha_vencimiento - obj.fecha_desembolso).days, 1)
+    elapsed_count = max(1, (duration_days + period_days - 1) // period_days)
+    planned_count = {"mensual": obj.plazo_meses, "quincenal": obj.plazo_meses * 2,
+                     "semanal": max(1, (obj.plazo_meses * 365 + 83) // 84)}[obj.frecuencia_pago]
+    count = min(elapsed_count, planned_count)
+    total_due = (obj.monto * (Decimal(1) + obj.tasa_interes / 100 * Decimal(obj.plazo_meses) / 12)).quantize(Decimal("0.01"))
+    amount = (total_due / count).quantize(Decimal("0.01"))
+    remainder = total_due - amount * (count - 1)
+    for n in range(1, count + 1):
+        due = obj.fecha_vencimiento if n == count else min(obj.fecha_desembolso + timedelta(days=period_days * n), obj.fecha_vencimiento)
+        installment = remainder if n == count else amount
+        db.add(Cuota(credito_id=obj.id, numero=n, fecha_vencimiento=due, monto=installment, saldo_pendiente=installment))
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(409, "No se pudo registrar el crédito y su cronograma")
+    db.refresh(obj)
+    return {"id": str(obj.id), "codigo": obj.codigo, "cuotas": count}
+
+
+@app.get("/api/creditos/{credit_id}")
+def get_credit(credit_id: UUID, db: Session = Depends(db_session), user=Depends(current_user)):
+    c = db.get(Credito, credit_id)
+    if not c: raise HTTPException(404, "Crédito no encontrado")
+    return {"id": str(c.id), "codigo": c.codigo, "cliente_id": str(c.cliente_id), "cliente": f"{c.cliente.nombres} {c.cliente.apellidos}", "monto": c.monto, "tasa_interes": c.tasa_interes, "plazo_meses": c.plazo_meses, "frecuencia_pago": c.frecuencia_pago, "fecha_desembolso": c.fecha_desembolso, "fecha_vencimiento": c.fecha_vencimiento, "saldo_pendiente": c.saldo_pendiente, "estado": c.estado, "cuotas": [{"id": str(q.id), "numero": q.numero, "fecha_vencimiento": q.fecha_vencimiento, "monto": q.monto, "saldo_pendiente": q.saldo_pendiente, "estado": q.estado} for q in c.cuotas]}
+
+
+@app.put("/api/creditos/{credit_id}")
+def update_credit(credit_id: UUID, payload: CreditoIn, db: Session = Depends(db_session), user=Depends(require_roles("administrador", "analista"))):
+    obj = db.get(Credito, credit_id)
+    if not obj: raise HTTPException(404, "Crédito no encontrado")
+    if payload.cliente_id != obj.cliente_id: raise HTTPException(422, "No se puede cambiar el cliente asociado al crédito")
+    terms = ("monto", "tasa_interes", "plazo_meses", "frecuencia_pago", "fecha_desembolso", "fecha_vencimiento")
+    if any(getattr(payload, key) != getattr(obj, key) for key in terms):
+        raise HTTPException(422, "No se pueden modificar las condiciones de un crédito con cronograma generado; registre una refinanciación")
+    if payload.saldo_pendiente is not None and payload.saldo_pendiente != obj.saldo_pendiente:
+        raise HTTPException(422, "El saldo se actualiza únicamente al registrar pagos")
+    obj.codigo = payload.codigo
+    obj.estado = payload.estado.value
+    db.commit()
+    return {"id": str(obj.id), "actualizado": True}
+
+
+@app.post("/api/pagos", status_code=201)
+def register_payment(payload: PagoIn, db: Session = Depends(db_session), user=Depends(require_roles("administrador", "cobranzas"))):
+    cuota = db.scalar(select(Cuota).where(Cuota.id == payload.cuota_id).with_for_update())
+    if not cuota: raise HTTPException(404, "Cuota no encontrada")
+    if payload.monto > cuota.saldo_pendiente: raise HTTPException(422, "El pago supera el saldo de la cuota")
+    if payload.referencia and db.scalar(select(Pago.id).where(Pago.cuota_id == cuota.id, Pago.referencia == payload.referencia)):
+        raise HTTPException(409, "Ya existe un pago con esa referencia para esta cuota")
+    pago = Pago(cuota_id=cuota.id, monto=payload.monto, referencia=payload.referencia)
+    db.add(pago)
+    cuota.saldo_pendiente -= payload.monto
+    cuota.estado = "pagada" if cuota.saldo_pendiente == 0 else "parcial"
+    credito = db.scalar(select(Credito).where(Credito.id == cuota.credito_id).with_for_update())
+    credito.saldo_pendiente = max(Decimal(0), credito.saldo_pendiente - payload.monto)
+    if credito.saldo_pendiente == 0: credito.estado = "pagado"
+    db.commit(); db.refresh(pago)
+    return {"id": str(pago.id), "cuota_id": str(cuota.id), "saldo_cuota": cuota.saldo_pendiente, "saldo_credito": credito.saldo_pendiente}
+
+
+@app.get("/api/pagos")
+def payment_history(credito_id: Optional[UUID] = None, limit: int = Query(100, ge=1, le=500), db: Session = Depends(db_session), user=Depends(current_user)):
+    stmt = (
+        select(Pago, Cuota, Credito)
+        .select_from(Pago)
+        .join(Cuota, Pago.cuota_id == Cuota.id)
+        .join(Credito, Cuota.credito_id == Credito.id)
+        .order_by(Pago.pagado_en.desc())
+        .limit(limit)
+    )
+    if credito_id:
+        stmt = stmt.where(Credito.id == credito_id)
+    return [{"id": str(p.id), "cuota_id": str(q.id), "credito_id": str(c.id), "credito": c.codigo, "numero_cuota": q.numero, "monto": p.monto, "pagado_en": p.pagado_en, "referencia": p.referencia} for p, q, c in db.execute(stmt)]
+
+
+@app.get("/api/predicciones")
+def predictions(credito_id: Optional[UUID] = None, db: Session = Depends(db_session), user=Depends(current_user)):
+    stmt = select(Prediccion).order_by(Prediccion.creado_en.desc()).limit(200)
+    if credito_id: stmt = stmt.where(Prediccion.credito_id == credito_id)
+    return [{"id": str(p.id), "credito_id": str(p.credito_id), "probabilidad_morosidad": p.probabilidad_morosidad, "nivel_riesgo": p.nivel_riesgo, "metodo": p.metodo, "factores": p.factores, "recomendacion": p.recomendacion, "creado_en": p.creado_en} for p in db.scalars(stmt)]
+
+
+@app.post("/api/predicciones/evaluar", status_code=201)
+def evaluate(credito_id: UUID, db: Session = Depends(db_session), user=Depends(require_roles("administrador", "analista"))):
+    c = db.get(Credito, credito_id)
+    if not c: raise HTTPException(404, "Crédito no encontrado")
+    today = date.today(); cuotas = list(c.cuotas)
+    late = [q for q in cuotas if q.saldo_pendiente > 0 and q.fecha_vencimiento < today]
+    max_days = max(((today - q.fecha_vencimiento).days for q in late), default=0)
+    pending = sum((q.saldo_pendiente for q in cuotas), Decimal(0))
+    factors=[]; score=Decimal("0.05")
+    if late:
+        factors.append(f"{len(late)} cuota(s) con saldo vencido"); score += min(Decimal("0.5"), Decimal(max_days) / 180)
+    if c.cliente.ingresos_mensuales and c.cliente.ingresos_mensuales > 0:
+        ratio = c.saldo_pendiente / (c.cliente.ingresos_mensuales * 12)
+        if ratio > Decimal("0.4"):
+            factors.append("Saldo superior al 40% del ingreso anual registrado"); score += min(Decimal("0.35"), ratio / 2)
+    else: factors.append("Ingresos del cliente no registrados; evaluación limitada")
+    if not factors: factors.append("Sin cuotas vencidas; evaluación basada en información disponible")
+    probability = min(Decimal("0.95"), score).quantize(Decimal("0.0001")); risk = "alto" if probability >= Decimal("0.5") else "medio" if probability >= Decimal("0.2") else "bajo"
+    recommendation = "Contactar al cliente y acordar seguimiento prioritario" if risk == "alto" else "Revisar cumplimiento de cuotas en el próximo ciclo" if risk == "medio" else "Mantener seguimiento regular"
+    if not cuotas:
+        raise HTTPException(422, "No hay cronograma de cuotas; no existen datos suficientes para evaluar este crédito")
+    import json
+    p = Prediccion(credito_id=c.id, probabilidad_morosidad=probability, nivel_riesgo=risk, factores=json.dumps(factors, ensure_ascii=False), recomendacion=recommendation)
+    db.add(p); db.commit(); db.refresh(p)
+    return {"id": str(p.id), "credito_id": str(c.id), "probabilidad_morosidad": probability, "nivel_riesgo": risk, "metodo": p.metodo, "factores": factors, "recomendacion": recommendation, "nota": "Evaluación preliminar basada en reglas explícitas; no es un modelo entrenado ni una decisión automática."}
+
+
+@app.get("/api/cobranzas")
+def collections(prioridad: str = "", db: Session = Depends(db_session), user=Depends(current_user)):
+    stmt = (
+        select(Cuota, Credito, Cliente)
+        .select_from(Cuota)
+        .join(Credito, Cuota.credito_id == Credito.id)
+        .join(Cliente, Credito.cliente_id == Cliente.id)
+        .where(Cuota.saldo_pendiente > 0)
+        .order_by(Cuota.fecha_vencimiento)
+    )
+    rows = db.execute(stmt).all(); today=date.today()
+    return [{"cuota_id": str(q.id), "credito_id": str(c.id), "credito": c.codigo, "cliente": f"{cl.nombres} {cl.apellidos}", "vence": q.fecha_vencimiento, "dias_atraso": max((today-q.fecha_vencimiento).days, 0), "saldo": q.saldo_pendiente, "estado": "vencida" if q.fecha_vencimiento < today else "pendiente"} for q,c,cl in rows if not prioridad or (prioridad == "alta") == (q.fecha_vencimiento < today)]
+
+
+@app.post("/api/cobranzas/gestiones", status_code=201)
+def create_collection(payload: GestionIn, db: Session = Depends(db_session), user=Depends(require_roles("administrador", "cobranzas"))):
+    if not db.get(Credito, payload.credito_id): raise HTTPException(404, "Crédito no encontrado")
+    if payload.cuota_id:
+        cuota=db.get(Cuota,payload.cuota_id)
+        if not cuota or cuota.credito_id != payload.credito_id: raise HTTPException(404, "Cuota no encontrada para este crédito")
+    g=GestionCobranza(**payload.model_dump(), usuario_id=user["id"]); db.add(g); db.commit(); db.refresh(g)
+    return {"id": str(g.id), "registrada": True}
+
+
+@app.get("/api/cobranzas/gestiones")
+def list_collection_actions(credito_id: Optional[UUID] = None, db: Session = Depends(db_session), user=Depends(current_user)):
+    stmt=select(GestionCobranza).order_by(GestionCobranza.creado_en.desc()).limit(200)
+    if credito_id: stmt=stmt.where(GestionCobranza.credito_id==credito_id)
+    return [{"id":str(g.id),"credito_id":str(g.credito_id),"cuota_id":str(g.cuota_id) if g.cuota_id else None,"canal":g.canal,"resultado":g.resultado,"notas":g.notas,"compromiso_fecha":g.compromiso_fecha,"seguimiento_fecha":g.seguimiento_fecha,"creado_en":g.creado_en} for g in db.scalars(stmt)]
+
+
+@app.get("/api/alertas")
+def alerts(db: Session = Depends(db_session), user=Depends(current_user)):
+    today=date.today()
+    due = db.execute(select(Cuota, Credito).join(Credito).where(Cuota.saldo_pendiente > 0, Cuota.fecha_vencimiento <= today + timedelta(days=7))).all()
+    for q,c in due:
+        overdue=q.fecha_vencimiento < today; key=f"cuota:{q.id}:{'vencida' if overdue else q.fecha_vencimiento}"
+        exists=db.scalar(select(Alerta.id).where(Alerta.clave_dedupe==key))
+        if not exists: db.add(Alerta(cuota_id=q.id, credito_id=c.id, tipo="cuota_vencida" if overdue else "proximo_vencimiento", mensaje=f"Cuota {q.numero} del crédito {c.codigo} {'vencida' if overdue else 'próxima a vencer'}", prioridad="alta" if overdue else "media", clave_dedupe=key))
+    for p in db.scalars(select(Prediccion).where(Prediccion.nivel_riesgo == "alto").order_by(Prediccion.creado_en.desc())):
+        key=f"riesgo_alto:{p.credito_id}"
+        if not db.scalar(select(Alerta.id).where(Alerta.clave_dedupe==key)):
+            db.add(Alerta(credito_id=p.credito_id,tipo="riesgo_alto",mensaje="Crédito clasificado con riesgo alto; requiere revisión humana",prioridad="alta",clave_dedupe=key))
+    for g in db.scalars(select(GestionCobranza).where(GestionCobranza.compromiso_fecha < today, GestionCobranza.compromiso_fecha.is_not(None))):
+        if "incumpl" in g.resultado.lower():
+            key=f"compromiso_incumplido:{g.id}"
+            if not db.scalar(select(Alerta.id).where(Alerta.clave_dedupe==key)):
+                db.add(Alerta(credito_id=g.credito_id,cuota_id=g.cuota_id,tipo="compromiso_incumplido",mensaje="Un compromiso de pago venció sin cumplimiento registrado",prioridad="alta",clave_dedupe=key))
+    db.commit()
+    return [{"id":str(a.id),"tipo":a.tipo,"mensaje":a.mensaje,"prioridad":a.prioridad,"creado_en":a.creado_en} for a in db.scalars(select(Alerta).where(Alerta.resuelta.is_(False)).order_by(Alerta.creado_en.desc()).limit(200))]
+
+
+@app.patch("/api/alertas/{alert_id}")
+def resolve_alert(alert_id: UUID, resuelta: bool = True, db: Session = Depends(db_session), user=Depends(require_roles("administrador", "analista", "cobranzas"))):
+    alert = db.get(Alerta, alert_id)
+    if not alert:
+        raise HTTPException(404, "Alerta no encontrada")
+    alert.resuelta = resuelta
+    db.commit()
+    return {"id": str(alert.id), "resuelta": alert.resuelta}
+
+
+@app.get("/api/reportes/cartera")
+def portfolio_report(desde: Optional[date]=None, hasta: Optional[date]=None, formato: str=Query("json", pattern="^(json|csv)$"), db: Session=Depends(db_session), user=Depends(current_user)):
+    if desde and hasta and desde > hasta:
+        raise HTTPException(422, "La fecha inicial no puede ser posterior a la fecha final")
+    stmt=select(Credito,Cliente).join(Cliente).order_by(Credito.creado_en.desc())
+    if desde: stmt=stmt.where(Credito.fecha_desembolso>=desde)
+    if hasta: stmt=stmt.where(Credito.fecha_desembolso<=hasta)
+    data=[{"codigo":c.codigo,"cliente":f"{cl.nombres} {cl.apellidos}","monto":str(c.monto),"saldo_pendiente":str(c.saldo_pendiente),"estado":c.estado,"fecha_desembolso":c.fecha_desembolso.isoformat(),"fecha_vencimiento":c.fecha_vencimiento.isoformat()} for c,cl in db.execute(stmt)]
+    if formato == "csv":
+        buf=io.StringIO(); writer=csv.DictWriter(buf,fieldnames=list(data[0]) if data else ["codigo","cliente","monto","saldo_pendiente","estado","fecha_desembolso","fecha_vencimiento"]); writer.writeheader(); writer.writerows(data)
+        return Response(buf.getvalue(),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=prestaia-cartera.csv"})
+    return {"total":len(data),"creditos":data}
+
+
+@app.get("/api/asistente")
+def assistant(q: str=Query(min_length=1, max_length=500), db: Session=Depends(db_session), user=Depends(current_user)):
+    data=dashboard_data(db); question=q.lower()
+    if any(w in question for w in ("cartera","saldo")): answer=f"La cartera registrada es S/ {data['cartera_total']:,.2f} y el saldo pendiente es S/ {data['saldo_pendiente']:,.2f}."
+    elif any(w in question for w in ("cliente",)): answer=f"Hay {data['clientes_registrados']} clientes registrados."
+    elif any(w in question for w in ("vencid","mora","atras")): answer=f"Se registran {data['creditos_vencidos']} cuotas vencidas; la morosidad sobre cuotas registradas es {data['porcentaje_morosidad']}%."
+    elif any(w in question for w in ("alerta",)): answer=f"Hay {data['alertas_activas']} alertas activas."
+    else: answer="Puedo consultar cartera, saldo pendiente, clientes, cuotas vencidas y alertas con los datos registrados."
+    return {"respuesta":answer,"origen":"estadísticas locales autorizadas","proveedor_ia_configurado":False}
